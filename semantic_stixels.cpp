@@ -6,12 +6,14 @@
 #include "matrix.h"
 #include "cost_function.h"
 
+#define UNUSED(x) ((void)x)
+
 #define USE_OPENMP
 #if defined(_OPENMP) && defined(USE_OPENMP)
 #ifdef _WIN32
 #define OMP_PARALLEL_FOR __pragma(omp parallel for schedule(dynamic))
 #else
-#define OMP_PARALLEL_FOR _Pragma(omp parallel for schedule(dynamic))
+#define OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(dynamic)")
 #endif
 #else
 #define OMP_PARALLEL_FOR
@@ -332,7 +334,7 @@ void SemanticStixelWorld::compute(const cv::Mat& disparity, const cv::Mat& score
 		param_.eps, param_.pOrd, param_.pGrav, param_.pBlg, groundDisparity);
 
 	// cost table
-	Matrixf costTable(w, h, 3), dispTable(w, h, 3);
+	Matrixf costTable(w, h, 3), dispTable(w, h);
 	Matrix<cv::Point> indexTable(w, h, 3);
 	Matrixi labelTable(w, h, 3);
 
@@ -501,6 +503,9 @@ OMP_PARALLEL_FOR
 			labelTable_u(vT, S) = minLabelS;
 
 			dispTable_u(vT) = minDispO;
+
+			UNUSED(minDispG);
+			UNUSED(minDispS);
 		}
 
 		// process vT = vhor to h
@@ -593,6 +598,9 @@ OMP_PARALLEL_FOR
 			labelTable_u(vT, S) = minLabelS;
 
 			dispTable_u(vT) = minDispO;
+
+			UNUSED(minDispG);
+			UNUSED(minDispS);
 		}
 	}
 

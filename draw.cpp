@@ -84,7 +84,6 @@ void colorizeSegmentation(const cv::Mat& score, const std::vector<cv::Vec3b>& co
 	{
 		uchar* ptrMaxClass = maxClass.ptr<uchar>(v);
 		cv::Vec3b* ptrSegm = segm.ptr<cv::Vec3b>(v);
-		float* ptrMaxScore = maxScore.ptr<float>(rows);
 		for (int u = 0; u < cols; u++)
 			ptrSegm[u] = colors[ptrMaxClass[u]];
 	}

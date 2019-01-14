@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.1)
 project(SemanticStixels)
 
 if (CMAKE_COMPILER_IS_GNUCXX)
-	set(CMAKE_CXX_FLAGS "-std=c++11 -Wall -O3")
+	set(CMAKE_CXX_FLAGS "-std=c++11 -O3 -Wall -msse4.1")
 endif (CMAKE_COMPILER_IS_GNUCXX)
 
 set(CMAKE_FIND_PACKAGE_SORT_ORDER NATURAL)
