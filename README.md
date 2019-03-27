@@ -70,8 +70,8 @@ Usage: semantic_stixels left-image [params]
 ```
 cd semantic_stixels
 
-./build/semantic_stixels kitti/2011_09_26_drive_0011_sync/image_02/data/%25010d.png \
---right-image=kitti/2011_09_26_drive_0011_sync/image_03/data/%25010d.png \
+./build/semantic_stixels kitti/2011_09_26_drive_0011_sync/image_02/data/%010d.png \
+--right-image=kitti/2011_09_26_drive_0011_sync/image_03/data/%010d.png \
 --camera=camera_parameters/kitti.xml \
 --model=enet/Enet-model-best.net \
 --classes=enet/classes.txt --colors=enet/colors.txt --geometry=enet/geometry.txt \
@@ -82,8 +82,8 @@ cd semantic_stixels
 ```
 cd semantic_stixels
 
-./build/semantic_stixels cityscapes/munich/munich_%2506d_000019_leftImg8bit.png \
---disparity=cityscapes/munich_disparity/munich_%2506d_000019_disparity.png \
+./build/semantic_stixels cityscapes/munich/munich_%06d_000019_leftImg8bit.png \
+--disparity=cityscapes/munich_disparity/munich_%06d_000019_disparity.png \
 --camera=camera_parameters/cityscapes.xml \
 --model=enet/Enet-model-best.net \
 --classes=enet/classes.txt --colors=enet/colors.txt --geometry=enet/geometry.txt \
