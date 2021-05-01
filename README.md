@@ -62,9 +62,9 @@ Usage: semantic_stixels [params] image-format-1 image-format-2
 	--depth-only
 		compute without semantic segmentation.
 	--sgm-scaledown
-        scaledown sgm input images for speedup.
+		scaledown sgm input images for speedup.
 	--wait-deley (value:1)
-        deley time of cv::waitKey.
+		deley time of cv::waitKey.
 ```
 
 ### Example
