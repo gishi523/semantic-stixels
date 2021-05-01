@@ -1,252 +1,202 @@
 #include <iostream>
 #include <fstream>
-#include <sstream>
-#include <string>
 #include <chrono>
 
-#include <opencv2/dnn.hpp>
+#include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/dnn.hpp>
 
-#include "semantic_stixels.h"
 #include "semi_global_matching.h"
+#include "semantic_stixels.h"
 #include "draw.h"
 
 static std::string keys =
-	"{ help  h      | | Print help message. }"
-	"{ @left-image  | | Path to input left image or image sequence. }"
-	"{ right-image  | | Path to input right image or image sequence. "
-						"Either right-image or disparity must be specified. }"
-	"{ disparity    | | Path to input disparity or disparity sequence. "
-						"Format follows Cityscapes Dataset (https://github.com/mcordts/cityscapesScripts) "
-						"Either right-image or disparity must be specified. }"
-	"{ camera       | | Path to camera parameters. }"
-	"{ model        | | Path to a binary file of model contains trained weights. }"
-	"{ classes      | | Path to a text file with names of classes. }"
-	"{ colors       | | Path to a text file with colors for an every class. }"
-	"{ geometry     | | Path to a text file with geometry (0:ground 1:object 2:sky -1:any) for an every class. }"
-	"{ width        | | Input image width for neural network. }"
-	"{ height       | | Input image height for neural network. }"
-	"{ downscale    | | Downscale disparity map. }"
-	"{ wait-deley   | 1 | Deley time of cv::waitKey. }"
-	"{ backend      | 0 | Choose one of computation backends: "
-						"0: automatically (by default), "
-						"1: Halide language (http://halide-lang.org/), "
-						"2: Intel's Deep Learning Inference Engine (https://software.intel.com/openvino-toolkit), "
-						"3: OpenCV implementation }"
-	"{ target       | 0 | Choose one of target computation devices: "
-						"0: CPU target (by default), "
-						"1: OpenCL, "
-						"2: OpenCL fp16 (half-float precision), "
-						"3: VPU }";
+"{ help  h         |   | print help message. }"
+"{ @image-format-1 |   | input left image sequence. }"
+"{ @image-format-2 |   | input right image or disparity sequence. }"
+"{ input-type      | 0 | type of input image pair (0:left-right 1:left-disparity) }"
+"{ camera          |   | path to camera parameters. }"
+"{ start-number    | 1 | start frame number. }"
+"{ model           |   | path to a binary file of model contains trained weights. }"
+"{ classes         |   | path to a text file with names of classes. }"
+"{ colors          |   | path to a text file with colors for each class. }"
+"{ geometry        |   | path to a text file with geometry id (0:ground 1:object 2:sky) for each class. }"
+"{ width           | 1024 | input image width for neural network. }"
+"{ height          |  512 | input image height for neural network. }"
+"{ backend         | 0 | computation backend. see cv::dnn::Net::setPreferableBackend. }"
+"{ target          | 0 | target device. see cv::dnn::Net::setPreferableTarget. }"
+"{ depth-only      |   | compute without semantic segmentation. }"
+"{ sgm-scaledown   |   | scaledown sgm input images for speedup. }"
+"{ wait-deley      | 1 | deley time of cv::waitKey. }";
 
-static void convertTo8bitGray(const cv::Mat& src, cv::Mat& dst)
+class SGMWrapper
 {
-	const int nchannels = src.channels();
-	CV_Assert(nchannels == 1 || nchannels == 3);
+public:
 
-	if (src.channels() == 3)
-		cv::cvtColor(src, dst, cv::COLOR_BGR2GRAY);
-	else
-		src.copyTo(dst);
-
-	if (dst.type() == CV_16U)
+	SGMWrapper(int numDisparities, bool scaleDown = false) : scaleDown_(scaleDown)
 	{
-		cv::normalize(dst, dst, 0, 255, cv::NORM_MINMAX);
-		dst.convertTo(dst, CV_8U);
+		SemiGlobalMatching::Parameters param;
+		param.numDisparities = scaleDown ? numDisparities / 2 : numDisparities;
+		param.medianKernelSize = -1;
+		param.max12Diff = 1;
+		param.pathType = SemiGlobalMatching::SCAN_4PATH;
+		sgm_ = cv::makePtr<SemiGlobalMatching>(param);
 	}
+
+	static void convertToGray(const cv::Mat& src, cv::Mat& dst)
+	{
+		if (src.type() == CV_8UC3)
+			cv::cvtColor(src, dst, cv::COLOR_BGR2GRAY);
+		else
+			dst = src;
+	}
+
+	void compute(const cv::Mat& I1, const cv::Mat& I2, cv::Mat& D1)
+	{
+		CV_Assert(I1.size() == I2.size() && I1.type() == I2.type());
+
+		convertToGray(I1, G1_);
+		convertToGray(I2, G2_);
+
+		if (scaleDown_)
+		{
+			cv::pyrDown(G1_, I1_);
+			cv::pyrDown(G2_, I2_);
+			sgm_->compute(I1_, I2_, D1_, D2_);
+			D1_.convertTo(Df_, CV_32F, 2. / SemiGlobalMatching::DISP_SCALE);
+			cv::resize(Df_, D1, I1.size(), 0, 0, cv::INTER_NEAREST);
+		}
+		else
+		{
+			sgm_->compute(G1_, G2_, D1_, D2_);
+			D1_.convertTo(D1, CV_32F, 1. / SemiGlobalMatching::DISP_SCALE);
+		}
+	}
+
+private:
+
+	cv::Mat G1_, G2_, I1_, I2_, D1_, D2_, Df_;
+	cv::Ptr<SemiGlobalMatching> sgm_;
+	bool scaleDown_;
+};
+
+class InferenceEngine
+{
+public:
+
+	InferenceEngine() {}
+
+	void init(const std::string& model, int backendId = 0, int targetId = 0)
+	{
+		net_ = cv::dnn::readNet(model);
+		net_.setPreferableBackend(backendId);
+		net_.setPreferableTarget(targetId);
+	}
+
+	void infer(const cv::Mat& src, cv::Mat& dst)
+	{
+		cv::dnn::blobFromImage(src, tensor_, 1. / 255, cv::Size(), cv::Scalar(), true, false);
+		net_.setInput(tensor_);
+		net_.forward(dst);
+
+		// squeeze batch dim [1,20,1024,512] -> [20,1024,512]
+		dst = cv::Mat(3, &dst.size.p[1], CV_32F, dst.data);
+	}
+
+private:
+
+	cv::dnn::Net net_;
+	cv::Mat tensor_;
+};
+
+static void preprocessImage(cv::Mat& image, cv::Size inputSize, bool isDisparity = false)
+{
+	if (!isDisparity && image.type() == CV_16U)
+		cv::normalize(image, image, 0, 255, cv::NORM_MINMAX, CV_8U);
+
+	if (image.size() != inputSize)
+		cv::resize(image, image, inputSize, 0, 0, isDisparity ? cv::INTER_NEAREST : cv::INTER_LINEAR);
 }
 
-static void convertToDisparity(const cv::Mat& src, cv::Mat& dst, int maxd)
+static void convertToDisparity(const cv::Mat& src, cv::Mat& dst, int maxd, float scaleFactor = 1)
 {
 	CV_Assert(src.depth() == CV_16U);
+	CV_Assert(src.channels() == 1);
 
-	cv::Mat tmp;
-	if (src.channels() == 3)
-		cv::cvtColor(src, tmp, cv::COLOR_BGR2GRAY);
-	else
-		tmp = src;
-
-	const float denom = 1.f / 256;
-	maxd = 256 * maxd + 1;
+	const float scale = scaleFactor / 256;
 
 	dst.create(src.size(), CV_32F);
 	for (int y = 0; y < dst.rows; y++)
 	{
-		const ushort* srcptr = tmp.ptr<ushort>(y);
-		float* dstptr = dst.ptr<float>(y);
+		const ushort* ptrSrc = src.ptr<ushort>(y);
+		float* ptrDst = dst.ptr<float>(y);
 		for (int x = 0; x < dst.cols; x++)
 		{
-			const ushort p = srcptr[x];
-			dstptr[x] = p > 0 && p < maxd ? denom * (p - 1) : -1.f;
+			const int p = ptrSrc[x];
+			const float d = scale * (p - 1);
+			ptrDst[x] = p > 0 && d < maxd ? d : -1;
 		}
 	}
 }
 
-static void softmax(const cv::Mat& score)
+void scaleCameraParams(CameraParameters& camera, float factorx, float factory)
 {
-	const int chns = score.size[1];
-	const int rows = score.size[2];
-	const int cols = score.size[3];
-
-	cv::Mat denom(rows, cols, CV_32F);
-	std::vector<cv::Mat> expScores(chns);
-
-	for (int ch = 0; ch < chns; ch++)
-	{
-		cv::Mat channel(rows, cols, CV_32F, (void*)score.ptr<float>(0, ch));
-		cv::Mat& expScore = expScores[ch];
-		cv::exp(channel, expScore);
-
-		if (ch == 0)
-			expScore.copyTo(denom);
-		else
-			cv::add(denom, expScore, denom);
-	}
-
-	for (int ch = 0; ch < chns; ch++)
-	{
-		cv::Mat channel(rows, cols, CV_32F, (void*)score.ptr<float>(0, ch));
-		cv::Mat& expScore = expScores[ch];
-		cv::divide(expScore, denom, channel);
-	}
+	camera.fu *= factorx;
+	camera.fv *= factory;
+	camera.u0 *= factorx;
+	camera.v0 *= factory;
 }
 
-std::vector<std::string> readClasses(const std::string& file)
+static CameraParameters readCameraParams(const std::string& filename)
 {
-	std::ifstream ifs(file.c_str());
-	if (ifs.fail())
-		CV_Error(cv::Error::StsError, "File " + file + " not found");
+	const cv::FileStorage fs(filename, cv::FileStorage::READ);
+	CV_Assert(fs.isOpened());
 
-	std::vector<std::string> classes;
-	std::string line;
-	while (std::getline(ifs, line))
-		classes.push_back(line);
-	return classes;
+	CameraParameters camera;
+	camera.fu = fs["FocalLengthX"];
+	camera.fv = fs["FocalLengthY"];
+	camera.u0 = fs["CenterX"];
+	camera.v0 = fs["CenterY"];
+	camera.baseline = fs["BaseLine"];
+	camera.height = fs["Height"];
+	camera.tilt = fs["Tilt"];
+	return camera;
 }
 
-std::vector<int> readGeometry(const std::string& file)
+template <class T = int, class GetValue>
+static std::vector<T> readLines(const std::string& file, GetValue getValue)
 {
 	std::ifstream ifs(file);
 	if (ifs.fail())
 		CV_Error(cv::Error::StsError, "File " + file + " not found");
-
-	std::vector<int> l2g;
+	std::vector<T> values;
 	std::string line;
 	while (std::getline(ifs, line))
-	{
-		std::istringstream ss(line);
-		int g;
-		ss >> g;
-		l2g.push_back(g);
-	}
-	return l2g;
+		values.push_back(getValue(line));
+	return values;
 }
 
-std::vector<cv::Vec3b> readColors(const std::string& file)
+static std::vector<std::string> readClasses(const std::string& file)
 {
-	std::ifstream ifs(file);
-	if (ifs.fail())
-		CV_Error(cv::Error::StsError, "File " + file + " not found");
+	return readLines<std::string>(file, [](const std::string& line) { return line; });
+}
 
-	std::vector<cv::Vec3b> colors;
-	std::string line;
-	while (std::getline(ifs, line))
+static std::vector<cv::Vec3b> readColors(const std::string& file)
+{
+	return readLines<cv::Vec3b>(file, [](const std::string& line)
 	{
 		std::istringstream ss(line);
 		int b, g, r;
 		ss >> b >> g >> r;
-		colors.push_back(cv::Vec3b(b, g, r));
-	}
-	return colors;
+		return cv::Vec3b(b, g, r);
+	});
 }
 
-class Enet
+static std::vector<int> readGeometry(const std::string& file)
 {
-public:
-
-	Enet() {}
-
-	Enet(const std::string& model, int width, int height, int backendId = 0, int targetId = 0)
-	{
-		read(model, width, height, backendId, targetId);
-	}
-
-	void read(const std::string& model, int width, int height, int backendId = 0, int targetId = 0)
-	{
-		scale = 0.00392f;
-		mean = cv::Scalar::all(0);
-		swapRB = true;
-		blobSize = cv::Size(width, height);
-
-		net = cv::dnn::readNet(model);
-		net.setPreferableBackend(backendId);
-		net.setPreferableTarget(targetId);
-
-		std::cout << "input size:" << blobSize << std::endl;
-	}
-
-	void forward(const cv::Mat& frame, cv::Mat& score)
-	{
-		// Create a 4D blob from a frame
-		cv::dnn::blobFromImage(frame, blob, scale, blobSize, mean, swapRB, false);
-
-		// Set input blob
-		net.setInput(blob);
-
-		// Make forward pass
-		net.forward(score);
-
-		// Apply softmax
-		softmax(score);
-	}
-
-private:
-
-	cv::Mat blob;
-	float scale;
-	cv::Scalar mean;
-	bool swapRB;
-	cv::Size blobSize;
-	cv::dnn::Net net;
-};
-
-class SGMWrapper
-{
-
-public:
-
-	SGMWrapper(int numDisparities)
-	{
-		SemiGlobalMatching::Parameters param;
-		param.numDisparities = numDisparities / 2;
-		param.max12Diff = -1;
-		param.medianKernelSize = -1;
-		sgm_ = cv::Ptr<SemiGlobalMatching>(new SemiGlobalMatching(param));
-	}
-
-	void compute(const cv::Mat& I1, const cv::Mat& I2, cv::Mat& D1, double scaleFactor = 1)
-	{
-		cv::pyrDown(I1, I1_);
-		cv::pyrDown(I2, I2_);
-
-		sgm_->compute(I1_, I2_, D1_, D2_);
-
-		scaleFactor *= 2;
-
-		cv::resize(D1_, D1, cv::Size(), scaleFactor, scaleFactor, cv::INTER_CUBIC);
-		cv::resize(D2_, D2, cv::Size(), scaleFactor, scaleFactor, cv::INTER_CUBIC);
-		D1 *= scaleFactor;
-		D2 *= scaleFactor;
-		cv::medianBlur(D1, D1, 3);
-		cv::medianBlur(D2, D2, 3);
-		SemiGlobalMatching::LRConsistencyCheck(D1, D2, 5);
-	}
-
-private:
-	cv::Mat I1_, I2_, D1_, D2_, D2;
-	cv::Ptr<SemiGlobalMatching> sgm_;
-};
+	return readLines<int>(file, [](const std::string& line) { return std::stoi(line); });
+}
 
 int main(int argc, char** argv)
 {
@@ -257,186 +207,156 @@ int main(int argc, char** argv)
 		return 0;
 	}
 
-	if (!parser.has("right-image") && !parser.has("disparity"))
-		CV_Error(cv::Error::StsError, "Either right-image or disparity must be specified");
+	const std::string format1 = parser.get<std::string>("@image-format-1");
+	const std::string format2 = parser.get<std::string>("@image-format-2");
+	const int startno = parser.get<int>("start-number");
 
-	const int hasDisaprity = parser.has("disparity");
+	// check input image
+	cv::Mat I1 = cv::imread(cv::format(format1.c_str(), startno), cv::IMREAD_UNCHANGED);
+	cv::Mat I2 = cv::imread(cv::format(format2.c_str(), startno), cv::IMREAD_UNCHANGED);
+	CV_Assert(!I1.empty() && !I2.empty() && I1.size() == I2.size());
 
-	// input images
-	const std::string cap1File = parser.get<std::string>("@left-image");
-	const std::string cap2File = hasDisaprity ? parser.get<std::string>("disparity") : parser.get<std::string>("right-image");
-	cv::VideoCapture cap1(cap1File);
-	cv::VideoCapture cap2(cap2File);
+	enum { INPUT_LEFT_AND_RIGHT = 0, INPUT_LEFT_AND_DISP };
+	const int inputType = parser.get<int>("input-type");
+	if (inputType == INPUT_LEFT_AND_RIGHT) CV_Assert(I1.type() == I2.type());
+	if (inputType == INPUT_LEFT_AND_DISP)  CV_Assert(I2.type() == CV_16U);
 
-	// stereo SGM
-	const int numDisparities = 128;
-	SGMWrapper sgm(numDisparities);
+	// setup stereo matching
+	const int numDisparities = 64;
+	SGMWrapper sgm(numDisparities, parser.has("sgm-scaledown"));
+	cv::Mat disparity, disparityColor;
 
-	// Enet
-	const std::string model = parser.get<std::string>("model");
-	const int width = parser.get<int>("width");
-	const int height = parser.get<int>("height");
-	const int backendId = parser.get<int>("backend");
-	const int targetId = parser.get<int>("target");
-	Enet enet(model, width, height, backendId, targetId);
+	// get input size
+	const cv::Size inputSize(parser.get<int>("width"), parser.get<int>("height"));
+	const float factorx = 1.f * inputSize.width / I1.cols;
+	const float factory = 1.f * inputSize.height / I1.rows;
 
-	// read camera parameters
-	const cv::FileStorage fs(parser.get<std::string>("camera"), cv::FileStorage::READ);
-	CV_Assert(fs.isOpened());
-
-	// semantic stixels
-	SemanticStixelWorld::Parameters param;
-	param.camera.fu = fs["FocalLengthX"];
-	param.camera.fv = fs["FocalLengthY"];
-	param.camera.u0 = fs["CenterX"];
-	param.camera.v0 = fs["CenterY"];
-	param.camera.baseline = fs["BaseLine"];
-	param.camera.height = fs["Height"];
-	param.camera.tilt = fs["Tilt"];
+	// setup semantic stixels
+	SemanticStixels::Parameters param;
 	param.dmax = numDisparities;
+	param.camera = readCameraParams(parser.get<std::string>("camera"));
+	scaleCameraParams(param.camera, factorx, factory);
 
-	// read downscale parameters
-	const bool downscale = parser.has("downscale");
-	const float scaleFactor = downscale ? 0.5f : 1.f;
-	if (downscale)
+	// setup track bar
+	const int stixelWidth[2] = { 4, 8 };
+	const int stixelYResolution[2] = { 4, 8 };
+	int stixelW = 1, stixelH = 0;
+	cv::namedWindow("trackbar");
+	cv::resizeWindow("trackbar", cv::Size(512, 256));
+	cv::createTrackbar("stixel W", "trackbar", &stixelW, 1);
+	cv::createTrackbar("stixel H", "trackbar", &stixelH, 1);
+
+	// setup semantic segmentation, if enabled
+	const bool withSemantic = !parser.has("depth-only");
+	InferenceEngine net;
+	cv::Mat predict, predictColor, legend;
+	ColorTable colors;
+	std::vector<std::string> classes;
+	if (withSemantic)
 	{
-		param.camera.fu *= scaleFactor;
-		param.camera.fv *= scaleFactor;
-		param.camera.u0 *= scaleFactor;
-		param.camera.v0 *= scaleFactor;
+		CV_Assert(I1.type() == CV_8UC3);
+
+		const std::string model = parser.get<std::string>("model");
+		const int backendId = parser.get<int>("backend");
+		const int targetId = parser.get<int>("target");
+		net.init(model, backendId, targetId);
+
+		classes = readClasses(parser.get<std::string>("classes"));
+		colors = readColors(parser.get<std::string>("colors"));
+		param.geometry = readGeometry(parser.get<std::string>("geometry"));
+
+		drawLegend(legend, classes, colors);
+		cv::imshow("legend", legend);
 	}
 
-	// read classes and geometry
-	const std::vector<std::string> classes = readClasses(parser.get<std::string>("classes"));
-	const std::vector<int> l2g = readGeometry(parser.get<std::string>("geometry"));
+	// setup semantic stixels
+	auto stixelWorld = SemanticStixels::create(param);
+	std::vector<Stixel> stixels;
+	cv::Mat drawDepth, drawSemantic;
 
-	SemanticStixelWorld stixelWorld(l2g, param);
-	std::vector<SemanticStixel> stixels;
-	cv::Mat I1, I2, gray1, gray2;
-	cv::Mat disparity, disparityColor;
-	cv::Mat score;
-
-	// draw params
-	const auto colors = readColors(parser.get<std::string>("colors"));
-	enum { DRAW_LABEL = 0, DRAW_DEPTH = 1 };
-	int drawMode = DRAW_LABEL;
 	const int deley = parser.get<int>("wait-deley");
-	const bool putTime = false;
-	cv::Mat legend;
-	drawLegend(legend, classes, colors);
 
-	for (int frameno = 0;; frameno++)
+	for (int frameno = startno;; frameno++)
 	{
-		cap1 >> I1;
-		cap2 >> I2;
-
+		I1 = cv::imread(cv::format(format1.c_str(), frameno), cv::IMREAD_UNCHANGED);
+		I2 = cv::imread(cv::format(format2.c_str(), frameno), cv::IMREAD_UNCHANGED);
 		if (I1.empty() || I2.empty())
 		{
-			std::cout << "Hit any key to exit." << std::endl;
-			cv::waitKey(0);
-			break;
+			std::cout << "imread failed." << std::endl;
+			frameno = startno - 1;
+			continue;
 		}
 
-		const auto t0 = std::chrono::steady_clock::now();
-
-		if (hasDisaprity)
-		{
-			// convert disparity following the Cityscapes dataset format
-			convertToDisparity(I2, disparity, numDisparities);
-
-			if (downscale)
-			{
-				cv::resize(disparity, disparity, cv::Size(), scaleFactor, scaleFactor, cv::INTER_NEAREST);
-				disparity *= scaleFactor;
-			}
-		}
-		else
-		{
-			// compute dispaliry by SGM
-			convertTo8bitGray(I1, gray1);
-			convertTo8bitGray(I2, gray2);
-			sgm.compute(gray1, gray2, disparity, scaleFactor);
-			disparity.convertTo(disparity, CV_32F, 1. / SemiGlobalMatching::DISP_SCALE);
-		}
+		preprocessImage(I1, inputSize);
+		preprocessImage(I2, inputSize, inputType == INPUT_LEFT_AND_DISP);
 
 		const auto t1 = std::chrono::steady_clock::now();
 
-		// compute segmentation
-		enet.forward(I1, score);
+		// compute dispaliry
+		if (inputType == INPUT_LEFT_AND_RIGHT)
+			sgm.compute(I1, I2, disparity);
+		else if (inputType == INPUT_LEFT_AND_DISP)
+			convertToDisparity(I2, disparity, numDisparities, factorx);
 
 		const auto t2 = std::chrono::steady_clock::now();
 
-		// compute semantic stixels
-		stixelWorld.compute(disparity, score, stixels);
+		// semantic segmentation
+		if (withSemantic)
+			net.infer(I1, predict);
 
 		const auto t3 = std::chrono::steady_clock::now();
 
-		const auto duration01 = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-		const auto duration12 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-		const auto duration23 = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
+		// compute semantic stixels
+		param.stixelWidth = stixelWidth[stixelW];
+		param.stixelYResolution = stixelYResolution[stixelH];
+		stixelWorld->setParameters(param);
 
-		////////////////////////////////////////////////////////////////////////////////////
-		// draw results
-		////////////////////////////////////////////////////////////////////////////////////
-		const cv::Size drawSize = disparity.size();
-		const int drawW = drawSize.width;
-		const int drawH = drawSize.height;
-		cv::Mat draw(2 * drawH, 2 * drawW, CV_8UC3);
-		cv::Mat roi0 = draw(cv::Rect(0, 0, drawW, drawH));
-		cv::Mat roi1 = draw(cv::Rect(drawW, 0, drawW, drawH));
-		cv::Mat roi2 = draw(cv::Rect(0, drawH, drawW, drawH));
-		cv::Mat roi3 = draw(cv::Rect(drawW, drawH, drawW, drawH));
+		if (withSemantic)
+			stixelWorld->compute(disparity, predict, stixels);
+		else
+			stixelWorld->compute(disparity, stixels);
 
-		cv::resize(I1, I1, drawSize);
-		I1.copyTo(roi0);
+		const auto t4 = std::chrono::steady_clock::now();
 
-		// colorize disparity
-		disparity.convertTo(disparityColor, CV_8U, 255. / numDisparities);
-		cv::applyColorMap(disparityColor, disparityColor, cv::COLORMAP_JET);
-		disparityColor.setTo(cv::Scalar::all(0), disparity < 0);
-		cv::resize(disparityColor, roi1, drawSize);
+		using duration = std::chrono::microseconds;
+		const auto duration12 = std::chrono::duration_cast<duration>(t2 - t1).count();
+		const auto duration23 = std::chrono::duration_cast<duration>(t3 - t2).count();
+		const auto duration34 = std::chrono::duration_cast<duration>(t4 - t3).count();
+
+		// colorize disparity and confidence map
+		colorizeDisparity(disparity, disparityColor, numDisparities);
 
 		// colorize segmentation
-		cv::Mat segmentImg;
-		colorizeSegmentation(score, colors, segmentImg);
-		cv::resize(segmentImg, segmentImg, drawSize, 0, 0, cv::INTER_NEAREST);
-		cv::addWeighted(I1, 0.1, segmentImg, 0.9, 0, roi2);
+		if (withSemantic)
+		{
+			colorizeSegmentation(predict, predictColor, colors);
+			cv::addWeighted(I1, 0.5, predictColor, 0.5, 0, predictColor);
+		}
 
 		// draw stixels
-		cv::Mat stixelImg(disparity.size(), CV_8UC3);
+		drawDepthStixels(I1, stixels, drawDepth, numDisparities);
+		if (withSemantic)
+			drawSemanticStixels(I1, stixels, drawSemantic, colors);
 
-		if (drawMode == DRAW_LABEL)
+		// put time
+		cv::putText(disparityColor, cv::format("dispaliry time: %4.1f [msec]", 1e-3 * duration12),
+			cv::Point(50, 50), 2, 0.75, cv::Scalar(255, 255, 255));
+		cv::putText(disparityColor, cv::format("inference time: %4.1f [msec]", 1e-3 * duration23),
+			cv::Point(50, 80), 2, 0.75, cv::Scalar(255, 255, 255));
+		cv::putText(disparityColor, cv::format("semantic-stixel time: %4.1f [msec]", 1e-3 * duration34),
+			cv::Point(50, 110), 2, 0.75, cv::Scalar(255, 255, 255));
+
+		cv::imshow("depth iput", disparityColor);
+		cv::imshow("semantic stixels (depth representation)", drawDepth);
+		if (withSemantic)
 		{
-			stixelImg = cv::Vec3b(255, 255, 255);
-			for (const auto& stixel : stixels)
-				drawStixel(stixelImg, stixel, colors[stixel.semanticId]);
-			cv::resize(stixelImg, stixelImg, drawSize, 0, 0);
+			cv::imshow("semantic iput", predictColor);
+			cv::imshow("semantic stixels (semantic representation)", drawSemantic);
 		}
-		else
-		{
-			stixelImg = cv::Vec3b(0, 0, 0);
-			for (const auto& stixel : stixels)
-				if (stixel.geometricId == SemanticStixel::GEOMETRIC_ID_OBJ)
-					drawStixel(stixelImg, stixel, dispToColor(stixel.disp, 64));
-			cv::resize(stixelImg, stixelImg, drawSize, 0, 0);
-		}
-		cv::addWeighted(I1, 0.3, stixelImg, 0.7, 0, roi3);
-
-		// put information
-		putInfo(roi1, "dispaliry input", putTime ? 1e-3 * duration01 : -1);
-		putInfo(roi2, "semantic input", putTime ? 1e-3 * duration12 : -1);
-		putInfo(roi3, "semantic stixels", putTime ? 1e-3 * duration23 : -1);
-
-		cv::imshow("Semantic Stixels Demo", draw);
-		cv::imshow("Legend", legend);
 
 		const char c = cv::waitKey(deley);
 		if (c == 27)
 			break;
-		if (c == 'p')
-			cv::waitKey(0);
-		if (c == 'm')
-			drawMode = !drawMode;
 	}
 
 	return 0;
