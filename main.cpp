@@ -323,7 +323,7 @@ int main(int argc, char** argv)
 		const auto duration23 = std::chrono::duration_cast<duration>(t3 - t2).count();
 		const auto duration34 = std::chrono::duration_cast<duration>(t4 - t3).count();
 
-		// colorize disparity and confidence map
+		// colorize disparity
 		colorizeDisparity(disparity, disparityColor, numDisparities);
 
 		// colorize segmentation

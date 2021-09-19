@@ -127,13 +127,13 @@ public:
 	*/
 	static cv::Ptr<SemanticStixels> create(const Parameters& param = Parameters());
 
-	/** @brief Computes semantic stixels from a disparity map and a disparity confidence.
+	/** @brief Computes semantic stixels from a disparity map.
 		@param disparity Input 32-bit disparity map.
 		@param stixels Output array of stixels.
 	*/
 	virtual void compute(const cv::Mat& disparity, std::vector<Stixel>& stixels) = 0;
 
-	/** @brief Computes semantic stixels from a disparity map and a disparity confidence.
+	/** @brief Computes semantic stixels from a disparity map.
 		@param disparity Input 32-bit disparity map.
 		@param predict Input 32-bit 3-dimensional semantic segmentation scores.
 		@param stixels Output array of stixels.
