@@ -107,7 +107,7 @@ you can pass `DNN_BACKEND_CUDA(=5)` and `DNN_TARGET_CUDA(=6)` to run the semanti
 --backend=5 --target=6
 ```
 
-With `--depth-only` argument, you can test slanted stixel computation with depth information only.
+With `--depth-only` argument, you can test semantic stixel computation with depth information only.
 
 ```
 cd semantic_stixels
